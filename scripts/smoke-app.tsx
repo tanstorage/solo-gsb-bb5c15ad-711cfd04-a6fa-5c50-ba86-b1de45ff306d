@@ -1,6 +1,6 @@
 /**
  * 冒烟测试：在 Node 中以 SSR 方式渲染 App 与边界追溯面板，验证渲染链路不抛异常、
- * 关键文案（零步证明 / 推导步骤 / 反向标记 / 不可追溯原因）存在。
+ * 关键文案（零步证明 / 推导步骤 / 反向标记 / 不可追溯原因 / 分层排程各层结果）存在。
  * 运行：npm run smoke（见 package.json scripts）
  */
 import { renderToString } from 'react-dom/server'
@@ -26,14 +26,20 @@ check(appHtml, '各事件相对锚点的时间窗', 'App')
 check(appHtml, '差分约束图', 'App')
 check(appHtml, '点击最早/最晚时间可追溯边界推导链', 'App')
 
-// 1b) 最小偏差排程（默认示例含期望时刻：恢复 +25 → D=5）
-check(appHtml, '最小偏差排程', '最小偏差排程')
-check(appHtml, '期望时刻', '最小偏差排程')
-check(appHtml, 'D = 5', '最小偏差排程')
-check(appHtml, '最大偏差', '最小偏差排程')
-check(appHtml, '达到 ±D', '最小偏差排程')
-check(appHtml, '已定时', '最小偏差排程')
-check(appHtml, '未定时', '最小偏差排程')
+// 1b) 分层最小偏差排程（默认示例：恢复=高优先级 期望 +25 → 高层 D=5；复盘=低优先级 → 低层 D=0）
+check(appHtml, '分层最小偏差排程', '分层最小偏差排程')
+check(appHtml, '期望时刻', '分层最小偏差排程')
+check(appHtml, '高优先级', '分层最小偏差排程')
+check(appHtml, '中优先级', '分层最小偏差排程')
+check(appHtml, '低优先级', '分层最小偏差排程')
+check(appHtml, 'D = 5', '分层最小偏差排程')
+check(appHtml, 'D = 0', '分层最小偏差排程')
+check(appHtml, '无参与事件', '分层最小偏差排程')
+check(appHtml, '最大偏差', '分层最小偏差排程')
+check(appHtml, '达到 ±D', '分层最小偏差排程')
+check(appHtml, '层级', '分层最小偏差排程')
+check(appHtml, '已定时', '分层最小偏差排程')
+check(appHtml, '未定时', '分层最小偏差排程')
 
 // 2) 主时间窗表 + 三种追溯形态
 const s = buildConsistentSample()

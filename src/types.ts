@@ -26,6 +26,9 @@ export interface Constraint {
   enabled: boolean
 }
 
+/** 期望时刻的优先级层级：高 / 中 / 低（按此顺序做字典序最小化） */
+export type PriorityLevel = 'high' | 'medium' | 'low'
+
 /** 应用持久化状态 */
 export interface AppState {
   events: TEvent[]
@@ -36,6 +39,11 @@ export interface AppState {
   anchorTime: string
   /** 各事件的期望时刻（事件 id -> 本地时间 ISO）；仅非锚点且与锚点连通的事件参与最小偏差排程 */
   desiredTimes: Record<string, string>
+  /**
+   * 各事件期望时刻的优先级层级（事件 id -> 高/中/低）。
+   * 仅对填写了期望时刻的非锚点事件有意义；缺省按「中」处理（兼容旧版存档）。
+   */
+  desiredPriorities: Record<string, PriorityLevel>
 }
 
 /** 差分图中的一条有向边 u -> v，权重 w（分钟），表示 t_v - t_u <= w */
@@ -108,7 +116,7 @@ export interface BoundTrace {
   steps: BoundTraceStep[]
 }
 
-/** 最小偏差排程中单个事件的结果 */
+/** 分层最小偏差排程中单个事件的结果 */
 export interface ScheduleEntry {
   eventIdx: number
   status: 'anchor' | 'scheduled' | 'unscheduled'
@@ -120,19 +128,40 @@ export interface ScheduleEntry {
   deviation: number | null
   /** 期望因事件未与锚点连通而被忽略 */
   desiredIgnored: boolean
+  /** 该事件期望时刻的优先级层级；未填写期望为 null（未填写层级时按「中」） */
+  priority: PriorityLevel | null
 }
 
-/** 最小偏差排程结果：全部启用约束与每个期望事件的 |实际 − 期望| ≤ D 同时可满足的最小非负整数 D */
+/** 分层最小偏差排程中单层（高/中/低）的结果 */
+export interface LayerResult {
+  /** 本层层级 */
+  level: PriorityLevel
+  /** 本层参与整体搜索的期望事件数量 */
+  count: number
+  /**
+   * 本层的最优容差 D（分钟）：在全部更高层容差已固定的前提下，
+   * 使本层全部期望 |实际 − 期望| ≤ D 同时可满足的最小非负整数；
+   * 本层无参与事件时为 null
+   */
+  D: number | null
+  /** 本层达到 |偏差| = D 的事件下标（按事件顺序） */
+  tightEventIdx: number[]
+  /** 本层期望事件在最终排程中的最大 |偏差|（整数输入下等于 D）；无参与事件为 null */
+  maxDeviation: number | null
+}
+
+/**
+ * 分层最小偏差排程结果。
+ * 对当前有效差分系统按 高 → 中 → 低 做字典序最小化：先求高优先级的最小最大偏差
+ * D_高，把 ±D_高 的钉住约束固定进边集后再求下一层；最终输出一份同时满足全部启用
+ * 约束与各层容差的确定性排程（同一累计差分图上的可行势，非分层排程的拼接）。
+ */
 export interface ScheduleResult {
-  /** 最小非负整数偏差 D（分钟） */
-  D: number
+  /** 各层结果，固定为高、中、低三层并按字典序优化顺序排列 */
+  layers: LayerResult[]
   /** 每个事件的排程条目（按事件顺序） */
   entries: ScheduleEntry[]
-  /** 达到 |偏差| = D 的事件下标（按事件顺序） */
-  tightEventIdx: number[]
-  /** 本排程中期望事件的最大 |偏差|（整数输入下等于 D） */
-  maxDeviation: number
-  /** 参与整体搜索的期望事件数量 */
+  /** 参与整体搜索的期望事件总数（各层 count 之和） */
   desiredCount: number
 }
 

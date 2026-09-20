@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { AppState, Constraint, TEvent } from './types'
+import type { AppState, Constraint, PriorityLevel, TEvent } from './types'
 import { analyze, traceBound } from './lib/graph'
 import { findMinimalRepairs } from './lib/repair'
 import { computeMinDeviationSchedule } from './lib/schedule'
@@ -33,7 +33,7 @@ export default function App() {
     saveState(state)
   }, [state])
 
-  const { events, constraints, anchorId, anchorTime, desiredTimes } = state
+  const { events, constraints, anchorId, anchorTime, desiredTimes, desiredPriorities } = state
 
   // —— 原始数据的实时分析（用于矛盾判定与修复搜索）——
   const result = useMemo(
@@ -69,13 +69,20 @@ export default function App() {
     return analyze(events, effectiveConstraints, anchorId)
   }, [events, effectiveConstraints, anchorId, previewOffIds, result])
 
-  // —— 最小偏差排程：仅在有效系统可满足且已设置锚点时计算；
-  //    编辑约束、锚点或期望值都会触发实时重算，矛盾时返回 null（不展示旧结果）——
+  // —— 分层最小偏差排程：仅在有效系统可满足且已设置锚点时计算；
+  //    编辑约束、锚点、期望值或优先级层级都会触发实时重算，矛盾时返回 null（不展示旧结果）——
   const anchorExists = anchorId != null && events.some((e) => e.id === anchorId)
   const schedule = useMemo(() => {
     if (!effectiveResult.satisfiable || !anchorExists) return null
-    return computeMinDeviationSchedule(events, effectiveConstraints, anchorId, anchorTime, desiredTimes)
-  }, [effectiveResult.satisfiable, anchorExists, events, effectiveConstraints, anchorId, anchorTime, desiredTimes])
+    return computeMinDeviationSchedule(
+      events,
+      effectiveConstraints,
+      anchorId,
+      anchorTime,
+      desiredTimes,
+      desiredPriorities,
+    )
+  }, [effectiveResult.satisfiable, anchorExists, events, effectiveConstraints, anchorId, anchorTime, desiredTimes, desiredPriorities])
 
   // 矛盾环相关集合（用于跨组件高亮；预览可满足时为空）
   const cycleEventIds = useMemo(() => {
@@ -169,12 +176,15 @@ export default function App() {
     setState((s) => {
       const desiredTimes = { ...s.desiredTimes }
       delete desiredTimes[id]
+      const desiredPriorities = { ...s.desiredPriorities }
+      delete desiredPriorities[id]
       return {
         ...s,
         events: s.events.filter((e) => e.id !== id),
         constraints: s.constraints.filter((c) => c.aId !== id && c.bId !== id),
         anchorId: s.anchorId === id ? null : s.anchorId,
         desiredTimes,
+        desiredPriorities,
       }
     })
   }
@@ -223,16 +233,31 @@ export default function App() {
     }))
   }
 
-  // 填写 / 清除某事件的期望时刻（与其他编辑一样退出预览并清除追溯，随后自动重算排程）
+  // 填写 / 清除某事件的期望时刻（与其他编辑一样退出预览并清除追溯，随后自动重算排程）；
+  // 清除期望时刻时一并移除其优先级层级
   const setDesiredTime = (id: string, iso: string | null) => {
     setPreviewIndex(null)
     setTraceReq(null)
     setState((s) => {
       const desiredTimes = { ...s.desiredTimes }
+      const desiredPriorities = { ...s.desiredPriorities }
       if (iso) desiredTimes[id] = iso
-      else delete desiredTimes[id]
-      return { ...s, desiredTimes }
+      else {
+        delete desiredTimes[id]
+        delete desiredPriorities[id]
+      }
+      return { ...s, desiredTimes, desiredPriorities }
     })
+  }
+
+  // 设置某事件期望时刻的优先级层级（高/中/低）；与其他编辑一样触发实时重算
+  const setDesiredPriority = (id: string, level: PriorityLevel) => {
+    setPreviewIndex(null)
+    setTraceReq(null)
+    setState((s) => ({
+      ...s,
+      desiredPriorities: { ...s.desiredPriorities, [id]: level },
+    }))
   }
 
   const loadSample = (kind: 'ok' | 'conflict') => {
@@ -467,25 +492,27 @@ export default function App() {
         />
       )}
 
-      {/* 最小偏差排程：期望时刻填写 + 整体搜索得到的最小偏差可行排程 */}
+      {/* 分层最小偏差排程：期望时刻与优先级填写 + 高→中→低字典序搜索得到的可行排程 */}
       <div style={{ marginTop: 16 }}>
         <SchedulePanel
           events={events}
           anchorId={anchorId}
           anchorTime={anchorTime}
           desiredTimes={desiredTimes}
+          desiredPriorities={desiredPriorities}
           satisfiable={effectiveResult.satisfiable}
           anchorExists={anchorExists}
           windows={effectiveResult.windows}
           schedule={schedule}
           onDesiredChange={setDesiredTime}
+          onPriorityChange={setDesiredPriority}
         />
       </div>
 
       <div className="footer-note">
         数据自动保存在浏览器 localStorage，刷新不丢失 · 停用某条约束可即时验证“去掉该证词后矛盾是否消除” ·
         修复方案的“一键预览”仅在内存生效，点击“确认应用”才会批量停用并写入本地存储 ·
-        期望时刻随项目一同持久化，编辑约束、锚点或期望值后最小偏差排程实时重算
+        期望时刻与优先级层级随项目一同持久化，编辑约束、锚点、期望值或层级后分层最小偏差排程实时重算
       </div>
     </div>
   )

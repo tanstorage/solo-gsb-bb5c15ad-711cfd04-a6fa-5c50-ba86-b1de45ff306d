@@ -12,6 +12,17 @@ export function loadState(): AppState | null {
     if (!parsed.desiredTimes || typeof parsed.desiredTimes !== 'object') {
       parsed.desiredTimes = {}
     }
+    // 旧版本存档没有优先级层级字段：规范化为空表（缺省按「中」参与排程），
+    // 并过滤手工篡改等原因产生的非法层级值
+    if (!parsed.desiredPriorities || typeof parsed.desiredPriorities !== 'object') {
+      parsed.desiredPriorities = {}
+    } else {
+      for (const [id, lv] of Object.entries(parsed.desiredPriorities)) {
+        if (lv !== 'high' && lv !== 'medium' && lv !== 'low') {
+          delete parsed.desiredPriorities[id]
+        }
+      }
+    }
     return parsed
   } catch {
     return null
