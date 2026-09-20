@@ -12,6 +12,18 @@ export interface TEvent {
 /** 关系方向：A 早于 B，或 A 晚于 B */
 export type Relation = 'earlier' | 'later'
 
+/** 期望时刻的分层优先级；排程按 高 → 中 → 低 做字典序最小化 */
+export type Priority = 'high' | 'medium' | 'low'
+
+/** 层级顺序（字典序最小化的求解与展示顺序：高 → 中 → 低） */
+export const PRIORITY_LEVELS = ['high', 'medium', 'low'] as const
+
+export const PRIORITY_LABEL: Record<Priority, string> = {
+  high: '高',
+  medium: '中',
+  low: '低',
+}
+
 /**
  * 一条“事件 A 比事件 B {早|晚} min..max 分钟”的约束。
  * min <= max，单位为分钟（整数）。
@@ -36,6 +48,8 @@ export interface AppState {
   anchorTime: string
   /** 各事件的期望时刻（事件 id -> 本地时间 ISO）；仅非锚点且与锚点连通的事件参与最小偏差排程 */
   desiredTimes: Record<string, string>
+  /** 各事件期望时刻的分层优先级（事件 id -> 高/中/低）；未填写时按「中」处理；随状态持久化 */
+  desiredPriorities: Record<string, Priority>
 }
 
 /** 差分图中的一条有向边 u -> v，权重 w（分钟），表示 t_v - t_u <= w */
@@ -118,21 +132,38 @@ export interface ScheduleEntry {
   desiredOffset: number | null
   /** 实际 − 期望（分钟）；仅对已填写期望且已定时的事件 */
   deviation: number | null
+  /** 该事件期望所属的优先级层（已填写有效期望时给出；未填写期望或锚点为 null） */
+  priority: Priority | null
   /** 期望因事件未与锚点连通而被忽略 */
   desiredIgnored: boolean
 }
 
-/** 最小偏差排程结果：全部启用约束与每个期望事件的 |实际 − 期望| ≤ D 同时可满足的最小非负整数 D */
+/** 单个优先级层的字典序最优结果 */
+export interface ScheduleLayerResult {
+  /** 层级（高 / 中 / 低） */
+  level: Priority
+  /** 本层最小最大偏差（固定更高层最优容差后求出）；本层无参与事件时为 null */
+  D: number | null
+  /** 本层参与整体搜索的期望事件数量 */
+  count: number
+  /** 本层中达到 |偏差| = D 的事件下标（按事件顺序；空层为空数组） */
+  tightEventIdx: number[]
+}
+
+/**
+ * 分层最小偏差排程结果：
+ * 对当前有效差分系统按 高 → 中 → 低 做字典序最小化（D高, D中, D低），
+ * 每层在固定更高层最优容差后求本层最小最大偏差；输出一份同时满足全部启用约束
+ * 与所有层钉住约束的确定性可行排程。
+ */
 export interface ScheduleResult {
-  /** 最小非负整数偏差 D（分钟） */
-  D: number
   /** 每个事件的排程条目（按事件顺序） */
   entries: ScheduleEntry[]
-  /** 达到 |偏差| = D 的事件下标（按事件顺序） */
-  tightEventIdx: number[]
-  /** 本排程中期望事件的最大 |偏差|（整数输入下等于 D） */
+  /** 各层的最优容差与达到 ±D 的事件（按 高 → 中 → 低 顺序） */
+  layers: [ScheduleLayerResult, ScheduleLayerResult, ScheduleLayerResult]
+  /** 本排程中全部参与期望事件的最大 |偏差|（整数输入下等于各非空层 D 的最大值） */
   maxDeviation: number
-  /** 参与整体搜索的期望事件数量 */
+  /** 参与整体搜索的期望事件数量（全部非空层之和） */
   desiredCount: number
 }
 

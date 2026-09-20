@@ -2,7 +2,8 @@ import { analyze, buildEdges, constraintToEdges, traceBound } from '../src/lib/g
 import { DEFAULT_STATE_LIMIT, findMinimalRepairs, MAX_PLANS } from '../src/lib/repair'
 import { computeMinDeviationSchedule } from '../src/lib/schedule'
 import { buildConsistentSample, buildContradictionSample } from '../src/lib/samples'
-import type { Constraint, ScheduleResult, TEvent } from '../src/types'
+import { loadState } from '../src/lib/storage'
+import type { Constraint, Priority, ScheduleResult, TEvent } from '../src/types'
 
 let passed = 0
 let failed = 0
@@ -459,7 +460,7 @@ function isoPlus(min: number): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-/** 性质校验：排程锚点为 0、满足全部启用约束、期望偏差均在 ±D 内 */
+/** 性质校验：排程锚点为 0、满足全部启用约束、各事件期望偏差不超过其所属层的最优 D */
 function scheduleFeasible(
   events: TEvent[],
   constraints: Constraint[],
@@ -468,6 +469,7 @@ function scheduleFeasible(
 ): boolean {
   const idx = new Map(events.map((e, i) => [e.id, i]))
   if (r.entries[idx.get(anchorId)!].offsetMin !== 0) return false
+  const dByLevel = new Map(r.layers.map((l) => [l.level, l.D]))
   for (const c of constraints) {
     if (!c.enabled) continue
     const ia = idx.get(c.aId)
@@ -479,10 +481,17 @@ function scheduleFeasible(
     const diff = c.relation === 'earlier' ? tb! - ta! : ta! - tb!
     if (diff < c.min - 1e-9 || diff > c.max + 1e-9) return false
   }
-  return r.entries.every((en) => en.deviation === null || Math.abs(en.deviation) <= r.D + 1e-9)
+  return r.entries.every((en) => {
+    if (en.deviation === null || !en.priority) return true
+    const D = dByLevel.get(en.priority)
+    return D !== null && D !== undefined && Math.abs(en.deviation) <= D + 1e-9
+  })
 }
 
-// ---- 最小偏差排程：可满足示例（恢复期望 +25 → D=5，恢复达到 −D）----
+/** 取某层结果 */
+const layerOf = (r: ScheduleResult, lv: Priority) => r.layers.find((l) => l.level === lv)!
+
+// ---- 最小偏差排程：可满足示例（恢复期望 +25 → 中层 D=5，恢复达到 −D；未传层级默认中）----
 {
   const s = buildConsistentSample()
   const byName = new Map(s.events.map((e, i) => [e.name, i]))
@@ -495,26 +504,32 @@ function scheduleFeasible(
   }
   const r = computeMinDeviationSchedule(s.events, s.constraints, s.anchorId, ANCHOR_ISO, desired)!
   assert(r !== null, '排程：示例可计算')
-  assert(r.D === 5, `排程：示例最小偏差 D=5（实际 ${r.D}）`)
-  assert(r.desiredCount === 2, '排程：2 个期望事件参与整体搜索')
+  assert(layerOf(r, 'medium').D === 5, `排程：示例中层最小偏差 D=5（实际 ${layerOf(r, 'medium').D}）`)
+  assert(layerOf(r, 'high').D === null && layerOf(r, 'low').D === null, '排程：未指定层级时高/低层无参与事件')
+  assert(layerOf(r, 'medium').count === 2 && r.desiredCount === 2, '排程：2 个期望事件参与整体搜索')
   const enRec = r.entries[recovered]
   assert(enRec.status === 'scheduled' && enRec.offsetMin === 20, '排程：恢复被钉在窗口端点 +20')
-  assert(enRec.deviation === -5, '排程：恢复偏差 −5（达到 −D）')
-  assert(r.tightEventIdx.includes(recovered), '排程：恢复列入达到 ±D 的事件')
-  assert(r.maxDeviation === 5, '排程：最大偏差恰为 D=5')
+  assert(enRec.deviation === -5 && enRec.priority === 'medium', '排程：恢复偏差 −5（达到中层 −D）')
+  assert(layerOf(r, 'medium').tightEventIdx.includes(recovered), '排程：恢复列入中层达到 ±D 的事件')
+  assert(r.maxDeviation === 5, '排程：最大偏差为各非空层 D 的最大值 5')
   const enPost = r.entries[postmortem]
-  assert(enPost.deviation !== null && Math.abs(enPost.deviation) <= 5, '排程：复盘偏差在 ±D 内')
+  assert(enPost.deviation !== null && Math.abs(enPost.deviation) <= 5, '排程：复盘偏差在中层 ±D 内')
   const enPress = r.entries[press]
   assert(enPress.status === 'unscheduled' && enPress.offsetMin === null, '排程：未连通事件标记未定时')
   assert(r.entries[byName.get('值班告警触发')!].status === 'anchor', '排程：锚点状态正确')
-  assert(scheduleFeasible(s.events, s.constraints, s.anchorId!, r), '排程：输出满足全部启用约束且偏差 ≤ D')
+  assert(scheduleFeasible(s.events, s.constraints, s.anchorId!, r), '排程：输出满足全部启用约束且各层偏差 ≤ 该层 D')
 }
 
-// ---- 最小偏差排程：内置示例自带的期望时刻（随项目持久化的数据）----
+// ---- 最小偏差排程：内置示例自带的期望时刻与层级（恢复=高，复盘=中）----
 {
   const s = buildConsistentSample()
-  const r = computeMinDeviationSchedule(s.events, s.constraints, s.anchorId, s.anchorTime, s.desiredTimes)!
-  assert(r !== null && r.D === 5, '排程：内置示例期望时刻对应 D=5')
+  const r = computeMinDeviationSchedule(
+    s.events, s.constraints, s.anchorId, s.anchorTime, s.desiredTimes, s.desiredPriorities,
+  )!
+  assert(r !== null, '排程：内置示例可计算')
+  assert(layerOf(r, 'high').D === 5, '排程：内置示例高层（恢复）D=5')
+  assert(layerOf(r, 'medium').D === 0, '排程：内置示例中层（复盘）D=0')
+  assert(layerOf(r, 'low').D === null, '排程：内置示例低层无事件')
   assert(scheduleFeasible(s.events, s.constraints, s.anchorId!, r), '排程：内置示例输出可行')
 }
 
@@ -537,8 +552,8 @@ function scheduleFeasible(
   assert(wx.earliestOffset === 0 && wx.latestOffset === 5, '排程：X 窗口被耦合收紧为 [0,5]')
   assert(wy.earliestOffset === 5 && wy.latestOffset === 10, '排程：Y 窗口被耦合收紧为 [5,10]')
   const r = computeMinDeviationSchedule(events, cs, 'a', ANCHOR_ISO, { x: isoPlus(10), y: isoPlus(0) })!
-  assert(r.D === 8, `排程：耦合系统整体搜索得 D=8（实际 ${r.D}），独立夹窗会误判为 5`)
-  assert(r.maxDeviation === 8 && r.tightEventIdx.length >= 1, '排程：耦合系统有事件达到 ±D')
+  assert(layerOf(r, 'medium').D === 8, `排程：耦合系统整体搜索得中层 D=8（实际 ${layerOf(r, 'medium').D}），独立夹窗会误判为 5`)
+  assert(r.maxDeviation === 8 && layerOf(r, 'medium').tightEventIdx.length >= 1, '排程：耦合系统有事件达到 ±D')
   assert(scheduleFeasible(events, cs, 'a', r), '排程：耦合系统输出可行')
 }
 
@@ -580,7 +595,7 @@ function scheduleFeasible(
     [s.events[byName.get('复盘会议')!].id]: isoPlus(120),
   }
   const r = computeMinDeviationSchedule(s.events, s.constraints, s.anchorId, ANCHOR_ISO, desired)!
-  assert(r.D === 0, '排程：期望全部可达时 D=0')
+  assert(layerOf(r, 'medium').D === 0, '排程：期望全部可达时中层 D=0')
   assert(
     r.entries.every((en) => en.deviation === null || en.deviation === 0),
     '排程：D=0 时全部期望偏差为 0',
@@ -607,6 +622,224 @@ function scheduleFeasible(
   const enPress = r.entries[press]
   assert(enPress.status === 'unscheduled' && enPress.desiredIgnored, '排程：未连通事件标记未定时且期望被忽略')
   assert(enPress.desiredOffset === 50, '排程：被忽略的期望仍记录偏移以便展示')
+}
+
+// ---- 最小偏差排程：未连通事件的期望被忽略并明确标记（层级仍回显）----
+{
+  const s = buildConsistentSample()
+  const byName = new Map(s.events.map((e, i) => [e.name, i]))
+  const press = byName.get('媒体报道')!
+  const r = computeMinDeviationSchedule(
+    s.events, s.constraints, s.anchorId, ANCHOR_ISO,
+    {
+      [s.events[byName.get('服务恢复')!].id]: isoPlus(25),
+      [s.events[press].id]: isoPlus(50),
+    },
+    { [s.events[press].id]: 'low' },
+  )!
+  assert(r.desiredCount === 1, '排程：未连通事件的期望不参与搜索（仅 1 个有效期望）')
+  const enPress = r.entries[press]
+  assert(enPress.status === 'unscheduled' && enPress.desiredIgnored, '排程：未连通事件标记未定时且期望被忽略')
+  assert(enPress.desiredOffset === 50, '排程：被忽略的期望仍记录偏移以便展示')
+  assert(enPress.priority === 'low', '排程：被忽略事件仍回显其层级')
+  assert(layerOf(r, 'low').D === null && layerOf(r, 'low').count === 0, '排程：低层因事件未连通而无参与')
+}
+
+// ==================== 分层字典序最小化 ====================
+
+// ---- 分层排程：耦合事件在不同层时先保高层（高层 D=5，低层 D=10）----
+{
+  // t_Y = t_X + 5；X、Y 各自窗口 [0,5]、[5,10]，期望 X=+10、Y=0。
+  // 单层时整体 D=8；若 X 为高、Y 为低：先最小化高层（仅 X），X 可达偏差 5（t_X=5）；
+  // 固定 X 在 [5,15] 的最优容差后 t_Y=10，低层 D低=10。
+  // 若反过来做加权和/同时优化，会得到 (8,8)——字典序结果 (5,10) 严格更优（首分量更小）。
+  const events: TEvent[] = [
+    { id: 'a', name: 'A' }, { id: 'x', name: 'X' }, { id: 'y', name: 'Y' },
+  ]
+  const cs: Constraint[] = [
+    { id: 'c1', aId: 'x', bId: 'a', relation: 'later', min: 0, max: 10, enabled: true },
+    { id: 'c2', aId: 'y', bId: 'a', relation: 'later', min: 0, max: 10, enabled: true },
+    { id: 'c3', aId: 'y', bId: 'x', relation: 'later', min: 5, max: 5, enabled: true },
+  ]
+  const r = computeMinDeviationSchedule(
+    events, cs, 'a', ANCHOR_ISO,
+    { x: isoPlus(10), y: isoPlus(0) },
+    { x: 'high', y: 'low' },
+  )!
+  assert(layerOf(r, 'high').D === 5, `分层：高层 D高=5（实际 ${layerOf(r, 'high').D}）`)
+  assert(layerOf(r, 'medium').D === null, '分层：中层无事件')
+  assert(layerOf(r, 'low').D === 10, `分层：固定高层最优后低层 D低=10（实际 ${layerOf(r, 'low').D}）`)
+  assert(r.entries[1].deviation === -5, '分层：X 偏差 −5（达到高层 −D）')
+  assert(r.entries[2].deviation === 10, '分层：Y 偏差 +10（达到低层 +D）')
+  assert(layerOf(r, 'high').tightEventIdx.join() === '1', '分层：高层达到 ±D 的仅 X')
+  assert(layerOf(r, 'low').tightEventIdx.join() === '2', '分层：低层达到 ±D 的仅 Y')
+  assert(r.entries[2].priority === 'low' && r.entries[1].priority === 'high', '分层：条目携带各自层级')
+  assert(scheduleFeasible(events, cs, 'a', r), '分层：输出同时满足全部启用约束')
+
+  // 对调层级：Y 为高 → D高=5（t_Y=5），X=0，低层 D低=10
+  const r2 = computeMinDeviationSchedule(
+    events, cs, 'a', ANCHOR_ISO,
+    { x: isoPlus(10), y: isoPlus(0) },
+    { x: 'low', y: 'high' },
+  )!
+  assert(layerOf(r2, 'high').D === 5 && layerOf(r2, 'low').D === 10, '分层：对调层级后高/低 D 仍为 5/10')
+  assert(r2.entries[1].deviation === -10 && r2.entries[2].deviation === 5, '分层：对调后 X 偏差 −10、Y 偏差 +5')
+  assert(scheduleFeasible(events, cs, 'a', r2), '分层：对调层级输出仍可行')
+}
+
+// ---- 分层排程：高优先级占满容差也不会被低层放松（字典序不是加权和）----
+{
+  // 三点等间隔链 t_B = t_A + 10、t_C = t_B + 10（相对锚点 A）。
+  // 期望 B=+15（高）、C=+25（低）。两者的期望互相可同时满足：B=15,C=25 → (D高=5, D低=5)。
+  // 构造低层想「拉回」C=20 的动机不存在时，高层仍保持自己的最优 5，低层只能接受耦合结果。
+  const events: TEvent[] = [
+    { id: 'a', name: 'A' }, { id: 'b', name: 'B' }, { id: 'c', name: 'C' },
+  ]
+  const cs: Constraint[] = [
+    { id: 'c1', aId: 'b', bId: 'a', relation: 'later', min: 10, max: 10, enabled: true },
+    { id: 'c2', aId: 'c', bId: 'b', relation: 'later', min: 10, max: 10, enabled: true },
+  ]
+  const r = computeMinDeviationSchedule(
+    events, cs, 'a', ANCHOR_ISO,
+    { b: isoPlus(15), c: isoPlus(25) },
+    { b: 'high', c: 'low' },
+  )!
+  assert(layerOf(r, 'high').D === 5 && layerOf(r, 'low').D === 5, '分层：等间隔链 (D高, D低) = (5, 5)')
+  assert(r.entries[1].deviation === -5 && r.entries[2].deviation === -5, '分层：B/C 偏差均为 −5')
+  assert(scheduleFeasible(events, cs, 'a', r), '分层：等间隔链输出可行')
+}
+
+// ---- 分层排程：高层固定后中层在受限空间内取自身最优 ----
+{
+  // t_Y = t_X + 5；期望 X=+10（高）、Y=0（中）。
+  // 高层单独最优 D高=5（X=5）；固定 X∈[5,15] 后 t_Y=10，中层 D中=10。
+  // 若不固定高层（单层合并）整体 D=8，说明中层结果确实是在高层最优约束下求出，
+  // 而不是把所有事件混在一起最小化。
+  const events: TEvent[] = [
+    { id: 'a', name: 'A' }, { id: 'x', name: 'X' }, { id: 'y', name: 'Y' },
+  ]
+  const cs: Constraint[] = [
+    { id: 'c1', aId: 'x', bId: 'a', relation: 'later', min: 0, max: 10, enabled: true },
+    { id: 'c2', aId: 'y', bId: 'a', relation: 'later', min: 0, max: 10, enabled: true },
+    { id: 'c3', aId: 'y', bId: 'x', relation: 'later', min: 5, max: 5, enabled: true },
+  ]
+  const r = computeMinDeviationSchedule(
+    events, cs, 'a', ANCHOR_ISO,
+    { x: isoPlus(10), y: isoPlus(0) },
+    { x: 'high', y: 'medium' },
+  )!
+  assert(layerOf(r, 'high').D === 5, '分层：高/中组合 D高=5')
+  assert(layerOf(r, 'medium').D === 10, `分层：固定高层后中层 D中=10（实际 ${layerOf(r, 'medium').D}；合并单层为 8）`)
+  assert(layerOf(r, 'low').D === null, '分层：低层无事件')
+  assert(scheduleFeasible(events, cs, 'a', r), '分层：高/中组合输出可行')
+}
+
+// ---- 分层排程：三层并存时各层 D 与各层 tight 事件正确 ----
+{
+  const s = buildConsistentSample()
+  const byName = new Map(s.events.map((e, i) => [e.name, i]))
+  const recovered = byName.get('服务恢复')!
+  const postmortem = byName.get('复盘会议')!
+  const onCall = byName.get('值班工程师介入')!
+  const desired = {
+    [s.events[recovered].id]: isoPlus(25),
+    [s.events[postmortem].id]: isoPlus(120),
+    [s.events[onCall].id]: isoPlus(0),
+  }
+  // 恢复=高（D高=5），复盘=中（D中=0），介入=低：介入窗口 [2,5]，期望 0 → D低=2
+  const prio: Record<string, Priority> = {
+    [s.events[recovered].id]: 'high',
+    [s.events[postmortem].id]: 'medium',
+    [s.events[onCall].id]: 'low',
+  }
+  const r = computeMinDeviationSchedule(s.events, s.constraints, s.anchorId, ANCHOR_ISO, desired, prio)!
+  assert(layerOf(r, 'high').D === 5, '分层三层：D高=5')
+  assert(layerOf(r, 'medium').D === 0, '分层三层：D中=0')
+  assert(layerOf(r, 'low').D === 2, `分层三层：D低=2（实际 ${layerOf(r, 'low').D}）`)
+  assert(layerOf(r, 'high').tightEventIdx.join() === String(recovered), '分层三层：高层 tight=恢复')
+  assert(layerOf(r, 'medium').tightEventIdx.join() === String(postmortem), '分层三层：D中=0 时 tight 含复盘')
+  assert(layerOf(r, 'low').tightEventIdx.join() === String(onCall), '分层三层：低层 tight=介入')
+  assert(r.desiredCount === 3 && r.maxDeviation === 5, '分层三层：参与数 3、整体最大偏差 5')
+  assert(scheduleFeasible(s.events, s.constraints, s.anchorId!, r), '分层三层：输出满足全部启用约束')
+  // 确定性：同输入同输出
+  const again = computeMinDeviationSchedule(s.events, s.constraints, s.anchorId, ANCHOR_ISO, desired, prio)!
+  assert(JSON.stringify(again) === JSON.stringify(r), '分层三层：相同输入输出确定一致')
+}
+
+// ---- 分层排程：D高=0 的严格可行，低层级只能在精确钉住高层的空间内求解 ----
+{
+  // 高层事件期望可达（D高=0）后被精确钉死；低层耦合事件的可行域因此被限制。
+  const events: TEvent[] = [
+    { id: 'a', name: 'A' }, { id: 'x', name: 'X' }, { id: 'y', name: 'Y' },
+  ]
+  const cs: Constraint[] = [
+    { id: 'c1', aId: 'x', bId: 'a', relation: 'later', min: 0, max: 10, enabled: true },
+    { id: 'c2', aId: 'y', bId: 'a', relation: 'later', min: 0, max: 10, enabled: true },
+    { id: 'c3', aId: 'y', bId: 'x', relation: 'later', min: 5, max: 5, enabled: true },
+  ]
+  // X 期望 3（可达，D高=0）；Y=t_X+5=8，期望 0 → D低=8
+  const r = computeMinDeviationSchedule(
+    events, cs, 'a', ANCHOR_ISO,
+    { x: isoPlus(3), y: isoPlus(0) },
+    { x: 'high', y: 'low' },
+  )!
+  assert(layerOf(r, 'high').D === 0, '分层：高层期望精确可达 D高=0')
+  assert(layerOf(r, 'low').D === 8, `分层：X 被精确钉在 3 后 Y=8，D低=8（实际 ${layerOf(r, 'low').D}）`)
+  assert(r.entries[1].deviation === 0 && r.entries[2].deviation === 8, '分层：X 偏差 0、Y 偏差 +8')
+  assert(scheduleFeasible(events, cs, 'a', r), '分层：精确钉住高层后输出可行')
+}
+
+// ---- 持久化：旧版本 localStorage（无 desiredPriorities）兼容，层级默认「中」----
+{
+  const store = new Map<string, string>()
+  const oldState = {
+    events: [{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }],
+    constraints: [{ id: 'c1', aId: 'b', bId: 'a', relation: 'later', min: 0, max: 10, enabled: true }],
+    anchorId: 'a',
+    anchorTime: ANCHOR_ISO,
+    desiredTimes: { b: isoPlus(20) },
+    // 注意：没有 desiredPriorities 字段（旧版本数据）
+  }
+  store.set('temporal-constraint-checker:v1', JSON.stringify(oldState))
+  const g = globalThis as { localStorage?: Storage }
+  g.localStorage = {
+    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+    setItem: (k: string, v: string) => void store.set(k, v),
+    removeItem: (k: string) => void store.delete(k),
+    clear: () => store.clear(),
+    key: (i: number) => [...store.keys()][i] ?? null,
+    get length() { return store.size },
+  } as Storage
+
+  const loaded = loadState()
+  assert(loaded !== null, '持久化：旧存档可正常载入')
+  assert(!!loaded && loaded.desiredPriorities && Object.keys(loaded.desiredPriorities).length === 0,
+    '持久化：旧存档的层级表规范化为空')
+  if (loaded) {
+    const r = computeMinDeviationSchedule(
+      loaded.events, loaded.constraints, loaded.anchorId, loaded.anchorTime,
+      loaded.desiredTimes, loaded.desiredPriorities,
+    )!
+    assert(layerOf(r, 'medium').D === 10, '持久化：无层级字段时期望按默认「中」参与（D中=10）')
+    assert(r.entries[1].priority === 'medium', '持久化：条目层级回显为默认「中」')
+  }
+  delete g.localStorage
+
+  // 非法层级值被过滤
+  const dirty = { ...oldState, desiredPriorities: { b: 'urgent', a: 'high' } }
+  store.set('temporal-constraint-checker:v1', JSON.stringify(dirty))
+  const g2 = globalThis as { localStorage?: Storage }
+  g2.localStorage = {
+    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+    setItem: () => {},
+    removeItem: () => {},
+    clear: () => {},
+    key: () => null,
+    length: 0,
+  } as Storage
+  const loaded2 = loadState()
+  assert(!!loaded2 && !('b' in loaded2.desiredPriorities), '持久化：非法层级值被丢弃')
+  delete g2.localStorage
 }
 
 console.log(`\n${passed} passed, ${failed} failed`)
